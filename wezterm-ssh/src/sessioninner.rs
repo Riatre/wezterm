@@ -20,6 +20,7 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -37,6 +38,11 @@ pub(crate) struct ChannelInfo {
 }
 
 pub(crate) type ChannelId = usize;
+
+pub(crate) struct PendingChannelSplice {
+    channel: ChannelWrap,
+    fd: FileDescriptor,
+}
 
 pub(crate) struct SessionInner {
     pub config: ConfigMap,
@@ -106,6 +112,8 @@ impl SessionInner {
 
     #[cfg(feature = "libssh-rs")]
     fn run_impl_libssh(&mut self) -> anyhow::Result<()> {
+        use smol::channel::unbounded;
+
         let hostname = self
             .config
             .get("hostname")
@@ -243,9 +251,32 @@ impl SessionInner {
             .try_send(SessionEvent::Authenticated)
             .context("notifying user that session is authenticated")?;
 
+        let rx_splice = if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
+            if let Some(identity_agent) = self.config.get("identityagent").map(|s| s.to_owned()) {
+                // Setup agent forward callback for session.
+                let (tx, rx) = unbounded();
+                sess.set_channel_open_request_auth_agent_callback(move |sess, make_result| {
+                    let fd = FileDescriptor::new(UnixStream::connect(&identity_agent)?);
+                    let channel = sess.new_channel()?;
+                    let result = make_result(&channel);
+                    tx.send_blocking(PendingChannelSplice {
+                        channel: ChannelWrap::LibSsh(channel),
+                        fd,
+                    })
+                    .unwrap();
+                    result
+                });
+                Some(rx)
+            } else {
+                log::error!("ForwardAgent is set to yes, but IdentityAgent is not set");
+                None
+            }
+        } else {
+            None
+        };
         sess.set_blocking(false);
         let mut sess = SessionWrap::with_libssh(sess);
-        self.request_loop(&mut sess)
+        self.request_loop(&mut sess, rx_splice)
     }
 
     #[cfg(feature = "ssh2")]
@@ -310,7 +341,7 @@ impl SessionInner {
         sess.set_blocking(false);
 
         let mut sess = SessionWrap::with_ssh2(sess);
-        self.request_loop(&mut sess)
+        self.request_loop(&mut sess, None)
     }
 
     /// Explicitly and directly connect to the requested host because
@@ -398,13 +429,20 @@ impl SessionInner {
         }
     }
 
-    fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
+    fn request_loop(
+        &mut self,
+        sess: &mut SessionWrap,
+        rx_splice: Option<Receiver<PendingChannelSplice>>,
+    ) -> anyhow::Result<()> {
         let mut sleep_delay = Duration::from_millis(100);
 
         loop {
             self.tick_io()?;
             self.drain_request_pipe();
             self.dispatch_pending_requests(sess)?;
+            if let Some(rx_splice) = rx_splice.as_ref() {
+                self.connect_pending_slices(rx_splice)?;
+            }
 
             if self.channels.is_empty() && self.session_was_dropped {
                 log::trace!(
@@ -801,6 +839,47 @@ impl SessionInner {
                 };
                 sess.set_blocking(false);
                 res
+            }
+        }
+    }
+
+    fn connect_pending_slices(
+        &mut self,
+        rx: &Receiver<PendingChannelSplice>,
+    ) -> anyhow::Result<()> {
+        match rx.try_recv() {
+            Err(TryRecvError::Closed) => anyhow::bail!("all clients are closed"),
+            Err(TryRecvError::Empty) => Ok(()),
+            Ok(mut req) => {
+                let channel_id = self.next_channel_id;
+                self.next_channel_id += 1;
+
+                req.fd.set_non_blocking(true)?;
+                let read_from_agent = req.fd;
+                let write_to_agent = read_from_agent.try_clone()?;
+
+                let info = ChannelInfo {
+                    channel_id,
+                    channel: req.channel,
+                    exit: None,
+                    exited: false,
+                    descriptors: [
+                        DescriptorState {
+                            fd: Some(read_from_agent),
+                            buf: VecDeque::with_capacity(8192),
+                        },
+                        DescriptorState {
+                            fd: Some(write_to_agent),
+                            buf: VecDeque::with_capacity(8192),
+                        },
+                        DescriptorState {
+                            fd: None,
+                            buf: VecDeque::with_capacity(8192),
+                        },
+                    ],
+                };
+                self.channels.insert(channel_id, info);
+                Ok(())
             }
         }
     }

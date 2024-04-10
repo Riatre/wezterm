@@ -58,6 +58,7 @@ fn main() {
     if let Some(user) = opts.user.as_ref() {
         config.insert("user".to_string(), user.to_string());
     }
+    config.insert("forwardagent".to_string(), "yes".to_string());
 
     let res = smol::block_on(async move {
         let (session, events) = Session::connect(config.clone())?;
