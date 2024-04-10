@@ -35,6 +35,7 @@ ssh2 = {version="0.9.3", features=["openssl-on-win32"], optional = true}
 libssh-rs = {path="../../libssh-rs/libssh-rs", features=["vendored"], optional = true}
 thiserror = "1.0"
 socket2 = "0.5"
+uds_windows = "1.1.0"
 
 # Not used directly, but is used to centralize the openssl vendor feature selection
 async_ossl = { path = "../async_ossl" }

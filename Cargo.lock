@@ -6612,6 +6612,7 @@ dependencies = [
  "ssh2",
  "termwiz",
  "thiserror",
+ "uds_windows",
  "whoami",
 ]
 

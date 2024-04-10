@@ -20,7 +20,6 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -252,11 +251,25 @@ impl SessionInner {
             .context("notifying user that session is authenticated")?;
 
         let rx_splice = if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
-            if let Some(identity_agent) = self.config.get("identityagent").map(|s| s.to_owned()) {
+            if let Some(identity_agent) = self.identity_agent() {
                 // Setup agent forward callback for session.
                 let (tx, rx) = unbounded();
                 sess.set_channel_open_request_auth_agent_callback(move |sess, make_result| {
-                    let fd = FileDescriptor::new(UnixStream::connect(&identity_agent)?);
+                    let fd = {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::net::UnixStream;
+                            FileDescriptor::new(UnixStream::connect(&identity_agent)?)
+                        }
+                        #[cfg(windows)]
+                        unsafe {
+                            use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+                            use uds_windows::UnixStream;
+                            FileDescriptor::from_raw_socket(
+                                UnixStream::connect(&identity_agent)?.into_raw_socket(),
+                            )
+                        }
+                    };
                     let channel = sess.new_channel()?;
                     let result = make_result(&channel);
                     tx.send_blocking(PendingChannelSplice {
@@ -555,8 +568,16 @@ impl SessionInner {
 
             let stdin = &mut chan.descriptors[0];
             if stdin.fd.is_some() && !stdin.buf.is_empty() {
-                write_from_buf(&mut chan.channel.writer(), &mut stdin.buf)
-                    .context("writing to channel")?;
+                if let Err(err) = write_from_buf(&mut chan.channel.writer(), &mut stdin.buf)
+                    .context("writing to channel")
+                {
+                    log::trace!(
+                        "Failed to write data to channel {} stdin: {:#}, closing pipe",
+                        id,
+                        err
+                    );
+                    stdin.fd.take();
+                }
             }
 
             for (idx, out) in chan
@@ -1022,6 +1043,13 @@ impl SessionInner {
                 Ok(sess.sftp.as_mut().expect("sftp should have been set above"))
             }
         }
+    }
+
+    pub fn identity_agent(&self) -> Option<String> {
+        self.config
+            .get("identityagent")
+            .map(|s| s.to_owned())
+            .or_else(|| std::env::var("SSH_AUTH_SOCK").ok())
     }
 }
 

@@ -219,8 +219,10 @@ impl crate::sessioninner::SessionInner {
         let mut channel = sess.open_session()?;
 
         if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
-            if let Err(err) = channel.request_auth_agent_forwarding() {
-                log::error!("Failed to request agent forwarding: {:#}", err);
+            if let Some(_) = self.identity_agent() {
+                if let Err(err) = channel.request_auth_agent_forwarding() {
+                    log::error!("Failed to request agent forwarding: {:#}", err);
+                }
             }
         }
 
